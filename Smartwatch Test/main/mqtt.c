@@ -7,6 +7,8 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "mqtt.h"
 #include <time.h>
@@ -19,11 +21,16 @@
 // MQTT broker URI
 #define MQTT_BROKER_URI "mqtt://broker.hivemq.com:1883"
 
-// MQTT topic
+// MQTT tooic
 #define MQTT_TOPIC "hexagon"
 
 // Global BPM value
 int global_bpm = 60;
+
+// Handles and queue/mutex from main.c
+extern QueueHandle_t bpmQueue;
+extern SemaphoreHandle_t bpmMutex;
+extern TaskHandle_t dataSendTaskHandle;
 
 static esp_mqtt_client_handle_t client;
 
@@ -104,24 +111,86 @@ void mqtt_init() {
     esp_mqtt_client_start(client);
 }
 
-// Task to publish fake BPM values
+// This task waits for BPM values from the queue and sends them to MQTT
 void data_send_task(void *pvParameters) {
+    int bpm_val = 0;
     while (1) {
-        char message[50];
-        snprintf(message, sizeof(message), "%d", global_bpm); // Use the global BPM value
-        esp_mqtt_client_publish(client, MQTT_TOPIC, message, 0, 0, 0); // Publish with default QoS and retain
-        ESP_LOGI(TAG, "Published: %s", message);
+        // Wait for a BPM value from the queue (waits up to 5 seconds)
+        if (xQueueReceive(bpmQueue, &bpm_val, pdMS_TO_TICKS(5000)) == pdPASS) {
+            // Try to lock the mutex for 100ms so we can safely update global_bpm
+            if (xSemaphoreTake(bpmMutex, pdMS_TO_TICKS(100))) {
+                global_bpm = bpm_val;
+                xSemaphoreGive(bpmMutex); // Always unlock!
+            }
+            char message[50];
+            snprintf(message, sizeof(message), "%d", bpm_val);
+            esp_mqtt_client_publish(client, MQTT_TOPIC, message, 0, 0, 0);
+            ESP_LOGI(TAG, "Published: %s (from task: %s)", message, pcTaskGetName(NULL));
+        } else {
+            // If nothing new, just send the current value
+            if (xSemaphoreTake(bpmMutex, pdMS_TO_TICKS(100))) {
+                bpm_val = global_bpm;
+                xSemaphoreGive(bpmMutex);
+            }
+            char message[50];
+            snprintf(message, sizeof(message), "%d", bpm_val);
+            esp_mqtt_client_publish(client, MQTT_TOPIC, message, 0, 0, 0);
+            ESP_LOGI(TAG, "Published (timeout): %s", message);
+        }
 
-        vTaskDelay(5000 / portTICK_PERIOD_MS); // Publish every 5 seconds
+        // Wait for a notification from the random BPM task, or timeout after 5 seconds
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
     }
 }
 
-// Task to randomly update BPM every 5 seconds
+// This task makes up a new BPM every 5 seconds and puts it in the queue
 void random_bpm_task(void *pvParameters) {
-    srand((unsigned int)time(NULL)); // Seed the random number generator once
+    srand((unsigned int)time(NULL));
+    int new_bpm = 0;
     while (1) {
-        global_bpm = 60 + (rand() % 101); // Generate a random value between 60 and 160
-        ESP_LOGI(TAG, "Randomly updated global BPM to: %d", global_bpm);
-        vTaskDelay(5000 / portTICK_PERIOD_MS); // Wait for 5 seconds
+        new_bpm = 60 + (rand() % 101);
+
+        // Try to put the new BPM in the queue (if it's full, just skip it)
+        if (xQueueSend(bpmQueue, &new_bpm, 0) != pdPASS) {
+            printf("BPM queue full, skipping value!\n");
+        }
+
+        // Tell the data send task that there's something new (notification)
+        xTaskNotifyGive(dataSendTaskHandle);
+
+        // Also update global_bpm for BLE (need to lock it first)
+        if (xSemaphoreTake(bpmMutex, pdMS_TO_TICKS(100))) {
+            global_bpm = new_bpm;
+            xSemaphoreGive(bpmMutex);
+        }
+
+        ESP_LOGI(TAG, "Randomly updated global BPM to: %d (from task: %s)", new_bpm, pcTaskGetName(NULL));
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds before next BPM
+    }
+}
+
+// This task makes up a new BPM every 5 seconds and puts it in the queue
+void random_bpm_task(void *pvParameters) {
+    srand((unsigned int)time(NULL));
+    int new_bpm = 0;
+    while (1) {
+        new_bpm = 60 + (rand() % 101);
+
+        // Try to put the new BPM in the queue (if it's full, just skip it)
+        if (xQueueSend(bpmQueue, &new_bpm, 0) != pdPASS) {
+            printf("BPM queue full, skipping value!\n");
+        }
+
+        // Tell the data send task that there's something new (notification)
+        xTaskNotifyGive(dataSendTaskHandle);
+
+        // Also update global_bpm for BLE (need to lock it first)
+        if (xSemaphoreTake(bpmMutex, pdMS_TO_TICKS(100))) {
+            global_bpm = new_bpm;
+            xSemaphoreGive(bpmMutex);
+        }
+
+        ESP_LOGI(TAG, "Randomly updated global BPM to: %d (from task: %s)", new_bpm, pcTaskGetName(NULL));
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds before next BPM
     }
 }

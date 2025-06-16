@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include "mqtt.h" 
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_bt.h"
@@ -8,11 +9,12 @@
 #include "esp_gatts_api.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "mqtt.h" // Include the sensor header to access global_bpm
+
 
 #define TAG "BLE"
 #define DEVICE_NAME "Hexagon Watch"
-
+// Use the mutex to safely read global_bpm
+extern SemaphoreHandle_t bpmMutex;
 // BLE Profile
 #define PROFILE_APP_ID 0
 
@@ -73,7 +75,7 @@ struct gatts_profile_inst {
     uint16_t service_handle;
     uint16_t char_handle;
     uint16_t extra_char_handle;
-    uint16_t broadcast_char_handle; // Handle for the broadcasting characteristic
+    uint16_t broadcast_char_handle; // Handle for the broadcsting characteristic
     uint16_t conn_id;
 };
 
@@ -111,20 +113,21 @@ void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     }
 }
 
-// GATT event handler
+// GATT event handler: handles BLE service/characteristic setup and client interactions
 void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
     switch (event) {
         case ESP_GATTS_REG_EVT:
             ESP_LOGI(TAG, "GATT server registered");
             gl_profile.gatts_if = gatts_if;
 
-            // Set device name
+            // Set the BLE device name that will show up when scanning
             esp_ble_gap_set_device_name(DEVICE_NAME);
 
-            // Configure advertising data
+            // Set up the advertising data (what is broadcasted to phones)
             esp_ble_gap_config_adv_data(&adv_data);
 
-            // Create GATT service
+            // Create the main BLE service for this device
+            // 10 is the number of handles (service + characteristics + descriptors)
             esp_err_t ret = esp_ble_gatts_create_service(gatts_if, &service_id, 10);
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to create service: %s", esp_err_to_name(ret));
@@ -136,7 +139,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                 ESP_LOGI(TAG, "Service created successfully, handle: %d", param->create.service_handle);
                 gl_profile.service_handle = param->create.service_handle;
 
-                // Add first characteristic
+                // Add the first characteristic (for example, a test value)
                 esp_bt_uuid_t char_uuid = {
                     .len = ESP_UUID_LEN_16,
                     .uuid = { .uuid16 = TEST_CHAR_UUID },
@@ -144,8 +147,8 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                 esp_err_t add_char_ret = esp_ble_gatts_add_char(
                     gl_profile.service_handle,
                     &char_uuid,
-                    ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-                    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE,
+                    ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, // Allow read and write from client
+                    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE, // Client can read/write
                     NULL,
                     NULL
                 );
@@ -153,7 +156,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                     ESP_LOGE(TAG, "Failed to add characteristic: %s", esp_err_to_name(add_char_ret));
                 }
 
-                // Add second characteristic
+                // Add a second characteristic (could be for extra data)
                 esp_bt_uuid_t extra_char_uuid = {
                     .len = ESP_UUID_LEN_16,
                     .uuid = { .uuid16 = EXTRA_CHAR_UUID },
@@ -170,7 +173,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                     ESP_LOGE(TAG, "Failed to add extra characteristic: %s", esp_err_to_name(add_extra_char_ret));
                 }
 
-                // Add third characteristic (broadcasting)
+                // Add a third characteristic for broadcasting (for example, heart rate)
                 esp_bt_uuid_t broadcast_char_uuid = {
                     .len = ESP_UUID_LEN_16,
                     .uuid = { .uuid16 = BROADCAST_CHAR_UUID },
@@ -183,8 +186,8 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                 esp_err_t add_broadcast_char_ret = esp_ble_gatts_add_char(
                     gl_profile.service_handle,
                     &broadcast_char_uuid,
-                    ESP_GATT_PERM_READ,
-                    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_BROADCAST,
+                    ESP_GATT_PERM_READ, // Only readable
+                    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_BROADCAST, // Read and broadcast
                     &broadcast_char_val,
                     NULL
                 );
@@ -200,7 +203,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
             if (param->add_char.status == ESP_GATT_OK) {
                 ESP_LOGI(TAG, "Characteristic added successfully, handle: %d", param->add_char.attr_handle);
 
-                // Assign handles to the appropriate characteristic
+                // Figure out which characteristic was just added by checking its UUID
                 if (param->add_char.char_uuid.uuid.uuid16 == TEST_CHAR_UUID) {
                     gl_profile.char_handle = param->add_char.attr_handle;
                 } else if (param->add_char.char_uuid.uuid.uuid16 == EXTRA_CHAR_UUID) {
@@ -209,7 +212,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                     gl_profile.broadcast_char_handle = param->add_char.attr_handle;
                 }
 
-                // Start the service after adding all characteristics
+                // Start the service only after all characteristics are added
                 if (gl_profile.char_handle && gl_profile.extra_char_handle && gl_profile.broadcast_char_handle) {
                     esp_ble_gatts_start_service(gl_profile.service_handle);
                 }
@@ -224,7 +227,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
             memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
             rsp.attr_value.handle = param->read.handle;
 
-            // Respond with the appropriate characteristic value
+            // Respond with the correct value depending on which characteristic is being read
             if (param->read.handle == gl_profile.char_handle) {
                 rsp.attr_value.len = sizeof(test_char_value);
                 memcpy(rsp.attr_value.value, &test_char_value, sizeof(test_char_value));
@@ -236,13 +239,14 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                 memcpy(rsp.attr_value.value, &broadcast_char_value, sizeof(broadcast_char_value));
             }
 
+            // Send the response back to the BLE client (like a phone app)
             esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
             break;
 
-            case ESP_GATTS_WRITE_EVT:
+        case ESP_GATTS_WRITE_EVT:
             ESP_LOGI(TAG, "Write request received, handle: %d, length: %d", param->write.handle, param->write.len);
 
-            // Update the appropriate characteristic value
+            // Update the correct variable depending on which characteristic was written
             if (param->write.handle == gl_profile.char_handle) {
                 if (param->write.len <= sizeof(test_char_value)) {
                     memcpy(&test_char_value, param->write.value, param->write.len);
@@ -261,7 +265,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
                 ESP_LOGW(TAG, "Write request ignored: invalid handle");
             }
 
-            // Send a response to the client
+            // Always send a response to the client after a write
             esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
             break;
 
@@ -272,7 +276,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
 
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(TAG, "Device disconnected. Restarting advertising...");
-            esp_ble_gap_start_advertising(&adv_params);
+            esp_ble_gap_start_advertising(&adv_params); // Restart advertising so new devices can connect
             break;
 
         default:
@@ -280,36 +284,42 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
     }
 }
 
-// Task to update the broadcasting value every 10 seconds
+// This task updates the BLE broadcast value every 10 seconds
 void update_broadcast_char_value_task(void *pvParameters) {
     while (1) {
-        broadcast_char_value = global_bpm; // Use the global BPM value
+        // Try to lock the mutex for 100ms before reading global_bpm
+        if (xSemaphoreTake(bpmMutex, pdMS_TO_TICKS(100))) {
+            broadcast_char_value = global_bpm;
+            xSemaphoreGive(bpmMutex);
+        }
         ESP_LOGI(TAG, "Updated broadcast_char_value to: %d", broadcast_char_value);
-
-        // Update the characteristic value
         esp_ble_gatts_set_attr_value(gl_profile.broadcast_char_handle, sizeof(broadcast_char_value), (uint8_t *)&broadcast_char_value);
-
-        // Delay for 10 seconds
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before next update
     }
 }
-
 // BLE initialization
 void ble_init() {
+
     ESP_ERROR_CHECK(nvs_flash_init());
+
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
+    // Set up and enable the Bluetooth controller in BLE mode
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+
+    // Initialize and enable the Bluedroid stack (ESP-IDF's Bluetooth stack)
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
 
+    // Register the GAP (advertising, connection) and GATT (services, characteristics) event handlers
     ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
     ESP_ERROR_CHECK(esp_ble_gatts_register_callback(gatts_event_handler));
     ESP_ERROR_CHECK(esp_ble_gatts_app_register(PROFILE_APP_ID));
 
-    // Start the task to update the broadcasting value
+    // Start the FreeRTOS task that periodically updates the broadcasted BPM value
+    // Stack size: 2048 words (~8KB), priority: 5 (medium priority for regular updates)
     xTaskCreate(update_broadcast_char_value_task, "Update Broadcast Char Value Task", 2048, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "BLE initialized");
