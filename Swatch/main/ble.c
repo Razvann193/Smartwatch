@@ -294,7 +294,7 @@ void update_broadcast_char_value_task(void *pvParameters) {
         }
         ESP_LOGI(TAG, "Updated broadcast_char_value to: %d", broadcast_char_value);
         esp_ble_gatts_set_attr_value(gl_profile.broadcast_char_handle, sizeof(broadcast_char_value), (uint8_t *)&broadcast_char_value);
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before next update
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 10 seconds before next update
     }
 }
 // BLE initialization

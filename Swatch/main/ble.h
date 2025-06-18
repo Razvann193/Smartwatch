@@ -12,4 +12,3 @@ void ble_init();
 void ble_send_data();
 
 #endif // BLE_H
-

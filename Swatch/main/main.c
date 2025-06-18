@@ -30,21 +30,17 @@ SemaphoreHandle_t bpmMutex = NULL;
 
 void app_main(void)
 {
+    // Create the queue and mutex first!
+    bpmQueue = xQueueCreate(5, sizeof(int));
+    if (!bpmQueue) printf("Failed to create BPM queue!\n");
+
+    bpmMutex = xSemaphoreCreateMutex();
+    if (!bpmMutex) printf("Failed to create BPM mutex!\n");
+
     ble_init();
     wifi_init();
     mqtt_init();
 
-    // Make a queue that can hold 5 ints (should be enough for bpm values)
-    bpmQueue = xQueueCreate(5, sizeof(int));
-    if (!bpmQueue) printf("Failed to create BPM queue!\n");
-
-    // Make a mutex 
-    bpmMutex = xSemaphoreCreateMutex();
-    if (!bpmMutex) printf("Failed to create BPM mutex!\n");
-
-    // Start the tasks. Stack size is in words not bytes! 512 = 2KB, 1024 = 4KB.
-    // Priority: higher = more important. Handles are for controling or cheecking the tasks later.
-    xTaskCreate(data_send_task, "Data Send Task", 1024, NULL, 5, &dataSendTaskHandle);
-    xTaskCreate(random_bpm_task, "Random BPM Task", 1024, NULL, 10, &randomBpmTaskHandle);
-    xTaskCreate(health_monitor_task, "Health Monitor Task", 768, NULL, 1, &healthMonitorTaskHandle);
+    xTaskCreate(data_send_task, "Data Send Task", 4096, NULL, 5, &dataSendTaskHandle);
+    xTaskCreate(random_bpm_task, "Random BPM Task", 2048, NULL, 10, &randomBpmTaskHandle);
 }

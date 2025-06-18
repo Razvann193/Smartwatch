@@ -169,28 +169,3 @@ void random_bpm_task(void *pvParameters) {
     }
 }
 
-// This task makes up a new BPM every 5 seconds and puts it in the queue
-void random_bpm_task(void *pvParameters) {
-    srand((unsigned int)time(NULL));
-    int new_bpm = 0;
-    while (1) {
-        new_bpm = 60 + (rand() % 101);
-
-        // Try to put the new BPM in the queue (if it's full, just skip it)
-        if (xQueueSend(bpmQueue, &new_bpm, 0) != pdPASS) {
-            printf("BPM queue full, skipping value!\n");
-        }
-
-        // Tell the data send task that there's something new (notification)
-        xTaskNotifyGive(dataSendTaskHandle);
-
-        // Also update global_bpm for BLE (need to lock it first)
-        if (xSemaphoreTake(bpmMutex, pdMS_TO_TICKS(100))) {
-            global_bpm = new_bpm;
-            xSemaphoreGive(bpmMutex);
-        }
-
-        ESP_LOGI(TAG, "Randomly updated global BPM to: %d (from task: %s)", new_bpm, pcTaskGetName(NULL));
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds before next BPM
-    }
-}
